@@ -1,0 +1,160 @@
+name: '🧹 Advanced Cleaner'
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'حالت پاکسازی'
+        required: true
+        type: choice
+        options:
+          - delete_all
+          - delete_newer
+          - delete_older
+        default: 'delete_all'
+      target_paths:
+        description: 'مسیر(ها) با جداکننده فاصله یا کاما (پیش‌فرض: videos downloads)'
+        required: false
+        type: string
+        default: 'videos downloads'
+      reference_date:
+        description: 'تاریخ مبنا (YYYY-MM-DD). برای delete_newer/older'
+        required: false
+        type: string
+        default: ''
+      keep_readme:
+        description: 'ایجاد README.md در پوشه‌های خالی؟'
+        required: false
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+        default: 'yes'
+
+permissions:
+  contents: write
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🧹 Clean
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          RAW_PATHS="${{ github.event.inputs.target_paths }}"
+          REF_DATE="${{ github.event.inputs.reference_date }}"
+          KEEP_README="${{ github.event.inputs.keep_readme }}"
+
+          # تبدیل جداکننده‌ها به خط جدید
+          PATHS=$(echo "$RAW_PATHS" | tr ',' ' ' | tr ';' ' ' | xargs -n1 | sort -u)
+          echo "Target paths: $PATHS"
+
+          # اگر حالت نیاز به تاریخ داشته باشد و خالی باشد، امروز را بگذار
+          if [ "$MODE" = "delete_newer" ] || [ "$MODE" = "delete_older" ]; then
+            if [ -z "$REF_DATE" ]; then
+              REF_DATE=$(date -u +%Y-%m-%d)
+              echo "Reference date set to today: $REF_DATE"
+            fi
+            if ! date -d "$REF_DATE" >/dev/null 2>&1; then
+              echo "Invalid date format. Use YYYY-MM-DD."
+              exit 1
+            fi
+          fi
+
+          declare -a FILES_TO_DELETE=()
+
+          for TARGET in $PATHS; do
+            if [ ! -d "$TARGET" ]; then
+              echo "⚠️  Path '$TARGET' does not exist, skipping."
+              continue
+            fi
+
+            echo "Processing: $TARGET (mode: $MODE)"
+
+            case "$MODE" in
+              delete_all)
+                # حذف تمام محتویات داخل مسیر
+                if [ "$(ls -A "$TARGET" 2>/dev/null)" ]; then
+                  echo "Removing all files/folders in $TARGET"
+                  rm -rf "${TARGET:?}"/*
+                  # حذف فایل‌های مخفی به‌جز .gitignore احتمالی (احتیاط)
+                  find "$TARGET" -mindepth 1 -maxdepth 1 -name '.*' ! -name '.gitignore' -exec rm -rf {} \; 2>/dev/null || true
+                else
+                  echo "Already empty."
+                fi
+                ;;
+
+              delete_newer|delete_older)
+                # یافتن فایل‌های ردیابی شده در این مسیر
+                while IFS= read -r -d '' file; do
+                  # گرفتن تاریخ آخرین commit این فایل
+                  LAST_DATE=$(git log -1 --format=%ad --date=short -- "$file" 2>/dev/null || echo "unknown")
+                  if [ "$LAST_DATE" = "unknown" ]; then continue; fi
+                  COMPARE=0
+                  if [ "$MODE" = "delete_newer" ]; then
+                    # حذف اگر تاریخ فایل > تاریخ مبنا (جدیدتر)
+                    if [[ "$LAST_DATE" > "$REF_DATE" ]]; then COMPARE=1; fi
+                  else
+                    # حذف اگر تاریخ فایل < تاریخ مبنا (قدیمی‌تر)
+                    if [[ "$LAST_DATE" < "$REF_DATE" ]]; then COMPARE=1; fi
+                  fi
+                  if [ $COMPARE -eq 1 ]; then
+                    echo "  → $file (last commit: $LAST_DATE)"
+                    FILES_TO_DELETE+=("$file")
+                  fi
+                done < <(git ls-files -z "$TARGET")
+                ;;
+            esac
+          done
+
+          # حذف فایل‌های انتخاب‌شده
+          if [ "$MODE" != "delete_all" ] && [ ${#FILES_TO_DELETE[@]} -gt 0 ]; then
+            for f in "${FILES_TO_DELETE[@]}"; do
+              git rm "$f"
+            done
+          fi
+
+          # ایجاد README.md در صورت درخواست
+          if [ "$KEEP_README" = "yes" ]; then
+            for TARGET in $PATHS; do
+              if [ ! -d "$TARGET" ]; then
+                mkdir -p "$TARGET"
+              fi
+              # اگر مسیر خالی است یا README.md وجود ندارد، ایجاد کن
+              if [ ! -f "$TARGET/README.md" ]; then
+                echo "Cleaned folder. Last operation: $MODE" > "$TARGET/README.md"
+                git add "$TARGET/README.md"
+              fi
+            done
+          fi
+
+          # اگر هیچ تغییری نبود، خروج بدون خطا
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+      - name: 📝 Commit and push changes
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          PATHS="${{ github.event.inputs.target_paths }}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          # ساخت پیام مناسب
+          MSG="🧹 Cleaner: $MODE on paths: $PATHS"
+          git commit -m "$MSG"
+
+          for i in 1 2 3; do
+            echo "Push attempt $i/3..."
+            if git pull --rebase origin "${{ github.ref_name }}" && git push origin HEAD:"${{ github.ref_name }}"; then
+              echo "Push successful"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Push failed after 3 attempts."
+          exit 1

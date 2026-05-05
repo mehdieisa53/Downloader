@@ -1,0 +1,464 @@
+name: '📥 Mega Downloader (YouTube + Direct)'
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_type:
+        description: 'نوع دانلود (auto = تشخیص خودکار)'
+        required: true
+        type: choice
+        options:
+          - auto
+          - youtube
+          - direct
+        default: 'auto'
+      url:
+        description: 'لینک ویدیوی یوتیوب یا فایل مستقیم'
+        required: true
+        type: string
+      quality:
+        description: 'کیفیت (فقط یوتیوب)'
+        required: false
+        type: choice
+        options:
+          - best
+          - 1080
+          - 720
+          - 480
+          - audio
+        default: 'best'
+      split_size:
+        description: 'حجم هر تکه (مثال: 95m)'
+        required: false
+        type: string
+        default: '95m'
+      password:
+        description: 'رمز فایل فشرده (اختیاری)'
+        required: false
+        type: string
+        default: ''
+      compression_format:
+        description: 'فرمت فشرده‌سازی'
+        required: false
+        type: choice
+        options:
+          - zip
+          - 7z
+        default: 'zip'
+    # (اختیاری) می‌توانید برای ورودی‌هایی که فقط در حالت یوتیوب لازم هستند شرط نمایش بگذارید،
+    # اما در workflow_dispatch گیت‌هاب چنین امکانی ندارد. بنابراین توضیح می‌دهیم.
+
+permissions:
+  contents: write
+
+jobs:
+  mega-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 🔧 Configure Git for large files
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: 🔍 Determine download mode
+        id: detect
+        run: |
+          MODE="${{ github.event.inputs.download_type }}"
+          URL="${{ github.event.inputs.url }}"
+          if [ "$MODE" = "auto" ]; then
+            if echo "$URL" | grep -qE '(youtube\.com/watch|youtu\.be/)'; then
+              MODE="youtube"
+            else
+              MODE="direct"
+            fi
+          fi
+          echo "final_mode=$MODE" >> $GITHUB_OUTPUT
+          echo "final_mode=$MODE" >> $GITHUB_ENV
+
+      - name: 🌐 Start WARP (YouTube only)
+        if: env.final_mode == 'youtube'
+        run: |
+          docker network create warp-net || true
+          docker run -d --name warp --restart=always --network warp-net \
+            -p 1080:1080 --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+          echo "Waiting 30s for WARP..."
+          sleep 30
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP active!"
+              break
+            fi
+            sleep 10
+          done
+
+      - name: 📦 Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg zip curl jq bc p7zip-full file
+          pip3 install --upgrade yt-dlp
+
+      - name: 📥 Download file
+        id: download
+        run: |
+          MODE="${{ env.final_mode }}"
+          URL="${{ github.event.inputs.url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          mkdir -p tmp_downloads
+
+          if [ "$MODE" = "youtube" ]; then
+            echo "Downloading YouTube video..."
+            # تعیین فرمت بر اساس کیفیت
+            case "$QUALITY" in
+              "audio") FORMAT="bestaudio" ;;
+              "best")  FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" ;;
+              "1080")  FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best" ;;
+              "720")   FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best" ;;
+              "480")   FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best" ;;
+              *)       FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" ;;
+            esac
+
+            # تابع دانلود با روش‌های مختلف
+            download_video() {
+              local METHOD=$1
+              case $METHOD in
+                1) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FORMAT" --merge-output-format mp4 -o "tmp_downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --fragment-retries 10 --concurrent-fragments 4 --no-check-certificates --prefer-free-formats "$URL" ;;
+                2) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FORMAT" --merge-output-format mp4 -o "tmp_downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --fragment-retries 10 --user-agent "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36" --extractor-args "youtube:player_client=android" "$URL" ;;
+                3) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FORMAT" --merge-output-format mp4 -o "tmp_downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --fragment-retries 10 --user-agent "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)" --extractor-args "youtube:player_client=ios" "$URL" ;;
+                4) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FORMAT" --merge-output-format mp4 -o "tmp_downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --fragment-retries 10 --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36" --extractor-args "youtube:player_client=web" --add-header "Accept-Language:en-US,en;q=0.9" "$URL" ;;
+                5) yt-dlp -f "$FORMAT" --merge-output-format mp4 -o "tmp_downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --fragment-retries 10 --concurrent-fragments 4 --no-check-certificates --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" "$URL" ;;
+                6) yt-dlp --proxy socks5://127.0.0.1:1080 -f "$FORMAT" --merge-output-format mp4 -o "tmp_downloads/%(title)s.%(ext)s" --no-playlist --retries 10 --fragment-retries 10 --extractor-args "youtube:player_client=tv_embedded" "$URL" ;;
+              esac
+            }
+            DOWNLOAD_SUCCESS=false
+            for METHOD in 1 2 3 4 5 6; do
+              if download_video $METHOD; then
+                DOWNLOAD_SUCCESS=true
+                echo "Download method $METHOD succeeded"
+                break
+              fi
+              sleep $((RANDOM % 10 + 5))
+            done
+            if [ "$DOWNLOAD_SUCCESS" = false ]; then
+              echo "All YouTube download methods failed"
+              exit 1
+            fi
+          else
+            echo "Direct download from URL..."
+            curl -L --fail --retry 5 --retry-delay 5 --progress-bar -o tmp_downloads/downloaded_file "$URL" || exit 1
+            # استخراج نام اصلی فایل از URL
+            RAW_NAME=$(basename "$URL" | sed 's/\?.*//' | sed 's/%20/ /g')
+            if [ -z "$RAW_NAME" ]; then RAW_NAME="downloaded_file"; fi
+            # تغییر نام به نام اصلی (با جایگزینی کاراکترهای غیرمجاز)
+            CLEAN_NAME=$(echo "$RAW_NAME" | sed 's/[\\/:*?"<>|]/_/g')
+            mv tmp_downloads/downloaded_file "tmp_downloads/${CLEAN_NAME}"
+            ls -la tmp_downloads/
+          fi
+
+      - name: 🗂️ Organize, compress and prepare files
+        run: |
+          SPLIT_SIZE="${{ github.event.inputs.split_size }}"
+          PASSWORD="${{ github.event.inputs.password }}"
+          COMP_FORMAT="${{ github.event.inputs.compression_format }}"
+          MODE="${{ env.final_mode }}"
+          URL="${{ github.event.inputs.url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          BACKUP_DIR="/tmp/download_backup_$$"
+          mkdir -p "$BACKUP_DIR"
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+
+          mkdir -p downloads
+
+          # تابع تشخیص دسته
+          categorize() {
+            local FILE="$1"
+            MIME=$(file -b --mime-type "$FILE")
+            EXT=$(echo "${FILE##*.}" | tr '[:upper:]' '[:lower:]')
+            if [[ "$MIME" == video/* ]] || [[ "$EXT" =~ ^(mp4|mkv|avi|mov|wmv|flv|webm)$ ]]; then echo "video"
+            elif [[ "$MIME" == audio/* ]] || [[ "$EXT" =~ ^(mp3|wav|ogg|flac|m4a)$ ]]; then echo "audio"
+            elif [[ "$MIME" == image/* ]] || [[ "$EXT" =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then echo "image"
+            elif [[ "$MIME" == application/pdf ]] || [[ "$EXT" =~ ^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt)$ ]]; then echo "document"
+            else echo "other"; fi
+          }
+
+          # تابع نام پوشه یکتا
+          RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain")
+          get_random_word() { echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"; }
+          get_unique_folder() {
+            local BASENAME="$1"
+            local BASE="downloads"
+            local NAME="$BASENAME"
+            if [ ! -d "$BASE/$NAME" ] && [ ! -d "$BACKUP_DIR/$NAME" ]; then echo "$NAME"; return; fi
+            while true; do
+              local SUFFIX=$(get_random_word)
+              if [ ! -d "$BASE/${NAME}_${SUFFIX}" ] && [ ! -d "$BACKUP_DIR/${NAME}_${SUFFIX}" ]; then
+                echo "${NAME}_${SUFFIX}"; return
+              fi
+            done
+          }
+
+          # توليد README.md اصلی (master) بعد از پردازش همه فايل‌ها
+          generate_master_readme() {
+            local README="downloads/README.md"
+            echo "# 📦 Downloaded Files List" > "$README"
+            echo "" >> "$README"
+            echo "---" >> "$README"
+            echo "" >> "$README"
+            local EMOJIS=("🎬" "🎥" "📽️" "🎞️" "📺" "🎦" "🎭" "🎪" "🎯" "🎮" "🎵" "🎶" "🎸" "🎹" "🎤" "📄" "📁" "📊" "🖼️" "📚" "📌")
+            local NUM=0
+            for folder in downloads/*/; do
+              [ -d "$folder" ] || continue
+              [ -f "$folder/README.md" ] || continue
+              NUM=$((NUM+1))
+              FOLDER_NAME=$(basename "$folder")
+              FOLDER_ENC=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$FOLDER_NAME")
+              LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/tree/${BRANCH}/downloads/${FOLDER_ENC}"
+              EMOJI="${EMOJIS[$RANDOM % ${#EMOJIS[@]}]}"
+              printf -- "- %s - %s [%s](%s)\n" "$NUM" "$EMOJI" "$FOLDER_NAME" "$LINK" >> "$README"
+            done
+            echo "Master README updated with $NUM items."
+          }
+
+          > /tmp/video_info.txt   # برای ذخیره اطلاعات جهت master README
+
+          FILE_INDEX=0
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+            FILENAME_NO_EXT="${BASENAME%.*}"
+            [ "$FILENAME_NO_EXT" = "$BASENAME" ] && FILENAME_NO_EXT="$BASENAME"  # بدون پسوند
+            FILE_INDEX=$((FILE_INDEX+1))
+
+            echo "Processing: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
+
+            CATEGORY=$(categorize "$FILE")
+            UNIQUE_FOLDER=$(get_unique_folder "$FILENAME_NO_EXT")
+            FINAL_DIR="$BACKUP_DIR/${CATEGORY}/${UNIQUE_FOLDER}"
+            mkdir -p "$FINAL_DIR"
+
+            # شمارش تعداد فایل‌ها برای master README
+            echo "${FILENAME_NO_EXT}|${UNIQUE_FOLDER}|${CATEGORY}" >> /tmp/video_info.txt
+
+            # محاسبه حجم تکه (عددی مگابایت)
+            CHUNK_MB="${SPLIT_SIZE%m}"
+            CHUNK_BYTES=$((CHUNK_MB * 1024 * 1024))
+
+            # COPY فایل به دایرکتوری موقت
+            TEMPFILE="video_${FILE_INDEX}.${BASENAME##*.}"
+            cp "$FILE" "tmp_downloads/${TEMPFILE}"
+            cd tmp_downloads
+
+            # تصمیم‌گیری برای فشرده‌سازی / تقسیم
+            if [ "$SIZE" -gt "$CHUNK_BYTES" ]; then
+              echo "Splitting into ${CHUNK_MB}MB parts..."
+              if [ "$COMP_FORMAT" = "zip" ]; then
+                if [ -n "$PASSWORD" ]; then
+                  zip -0 -s "${CHUNK_MB}m" -P "$PASSWORD" "${TEMPFILE%.*}.zip" "$TEMPFILE"
+                else
+                  zip -0 -s "${CHUNK_MB}m" "${TEMPFILE%.*}.zip" "$TEMPFILE"
+                fi
+                # انتقال قطعات
+                for part in ${TEMPFILE%.*}.z[0-9]* ${TEMPFILE%.*}.zip; do
+                  [ -f "$part" ] && mv "$part" "$FINAL_DIR/${UNIQUE_FOLDER}.${part##*.}"
+                done
+              else # 7z
+                if [ -n "$PASSWORD" ]; then
+                  7z a -p"$PASSWORD" -mhe=on -mx=3 -v"${SPLIT_SIZE}" "$FINAL_DIR/${UNIQUE_FOLDER}.7z" "$TEMPFILE"
+                else
+                  7z a -mhe=on -mx=3 -v"${SPLIT_SIZE}" "$FINAL_DIR/${UNIQUE_FOLDER}.7z" "$TEMPFILE"
+                fi
+                # 7z خروجی را همونجا می‌ریزد
+              fi
+              PART_COUNT=$(ls "$FINAL_DIR"/*.7z.* 2>/dev/null | wc -l)
+              [ "$COMP_FORMAT" = "zip" ] && PART_COUNT=$(ls "$FINAL_DIR"/*.z[0-9]* 2>/dev/null | wc -l)
+              echo "Created $PART_COUNT parts"
+            else
+              # فایل کوچک، بدون تقسیم
+              if [ "$COMP_FORMAT" = "zip" ]; then
+                if [ -n "$PASSWORD" ]; then
+                  zip -j -P "$PASSWORD" "$FINAL_DIR/${UNIQUE_FOLDER}.zip" "$TEMPFILE"
+                else
+                  zip -j "$FINAL_DIR/${UNIQUE_FOLDER}.zip" "$TEMPFILE"
+                fi
+              else
+                if [ -n "$PASSWORD" ]; then
+                  7z a -p"$PASSWORD" -mhe=on -mx=3 "$FINAL_DIR/${UNIQUE_FOLDER}.7z" "$TEMPFILE"
+                else
+                  7z a -mhe=on -mx=3 "$FINAL_DIR/${UNIQUE_FOLDER}.7z" "$TEMPFILE"
+                fi
+              fi
+            fi
+            rm -f "$TEMPFILE"
+            cd ..
+
+            # تولید README.md برای این پوشه
+            TOTAL_PARTS=$(ls "$FINAL_DIR"/*.z[0-9]* "$FINAL_DIR"/*.zip "$FINAL_DIR"/*.7z* 2>/dev/null | wc -l)
+            TOTAL_SIZE_MB=$(du -sh "$FINAL_DIR" | cut -f1)
+            # ساخت لینک‌های دانلود
+            LINK_MD=""
+            for part in "$FINAL_DIR"/*; do
+              [ -f "$part" ] || continue
+              PART_NAME=$(basename "$part")
+              PART_ENC=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$PART_NAME")
+              FOLDER_ENC=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$UNIQUE_FOLDER")
+              RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${CATEGORY}/${FOLDER_ENC}/${PART_ENC}"
+              LINK_MD="${LINK_MD}| $(basename "$part") | [Download](${RAW_LINK}) |\n"
+            done
+
+            README_FILE="$FINAL_DIR/README.md"
+            {
+              echo "# ${BASENAME}"
+              echo ""
+              echo "---"
+              echo ""
+              echo "## File Information"
+              echo ""
+              echo "| Property | Value |"
+              echo "|----------|-------|"
+              echo "| **File Name** | \`${BASENAME}\` |"
+              if [ "$MODE" = "youtube" ]; then
+                echo "| **YouTube Link** | [Video](${URL}) |"
+              else
+                echo "| **Direct Link** | [Link](${URL}) |"
+              fi
+              echo "| **Total Size** | **${TOTAL_PARTS} part(s)** - **${TOTAL_SIZE_MB}** |"
+              echo "| **Quality** | **${QUALITY}** |"
+              [ -n "$PASSWORD" ] && echo "| **Password Protected** | **YES** |" || echo "| **Password Protected** | **NO** |"
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Download Links"
+              echo ""
+              echo "| File | Link |"
+              echo "|------|------|"
+              printf "$LINK_MD"
+              echo ""
+              echo "---"
+              echo "*Generated by Mega Downloader*"
+            } > "$README_FILE"
+          done
+
+          rm -rf tmp_downloads
+          echo "Backup dir contents:"
+          find "$BACKUP_DIR" -type f | head -30
+
+      - name: 🛑 Stop WARP container
+        if: always()
+        run: docker stop warp 2>/dev/null; docker rm warp 2>/dev/null || true
+
+      - name: 📤 Incremental Commit & Push
+        run: |
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          BRANCH="${GITHUB_REF_NAME}"
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+
+          echo "Starting incremental push..."
+
+          git fetch origin "$BRANCH"
+          git reset --hard origin/"$BRANCH"
+
+          mkdir -p downloads
+          cp -r "$BACKUP_DIR"/* downloads/
+
+          # ابتدا فایل‌های README (کوچک) را شناسایی و push می‌کنیم
+          mapfile -t ALL_FILES < <(find downloads -type f \( -name "README.md" -o -name "*.z[0-9]*" -o -name "*.zip" -o -name "*.7z" -o -name "*.7z.[0-9]*" \) | sort)
+          TOTAL_FILES=${#ALL_FILES[@]}
+
+          # تابع push افزایشی مشابه 02-yt-dl.yml
+          push_batch() {
+            local BATCH_SIZE=3
+            local FILES=("$@")
+            local BATCH_FILES=()
+            for FILE in "${FILES[@]}"; do
+              BATCH_FILES+=("$FILE")
+              if [ ${#BATCH_FILES[@]} -ge $BATCH_SIZE ]; then
+                git fetch origin "$BRANCH" --quiet
+                git reset --hard origin/"$BRANCH" --quiet
+                cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null
+                for f in "${BATCH_FILES[@]}"; do git add "$f" 2>/dev/null; done
+                if ! git diff --cached --quiet; then
+                  git commit -m "[AVASAM] Add batch files [skip ci]"
+                  for i in {1..5}; do
+                    if timeout 180 git push origin HEAD:"$BRANCH"; then break; fi
+                    sleep $((5 + RANDOM % 10))
+                    git fetch origin "$BRANCH" --quiet
+                    git reset --hard origin/"$BRANCH" --quiet
+                    cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null
+                    for f in "${BATCH_FILES[@]}"; do git add "$f" 2>/dev/null; done
+                    git commit -m "[AVASAM] Add batch files [skip ci]" || true
+                  done
+                fi
+                BATCH_FILES=()
+                sleep 2
+              fi
+            done
+            # باقی‌مانده
+            if [ ${#BATCH_FILES[@]} -gt 0 ]; then
+              git fetch origin "$BRANCH" --quiet
+              git reset --hard origin/"$BRANCH" --quiet
+              cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null
+              for f in "${BATCH_FILES[@]}"; do git add "$f" 2>/dev/null; done
+              if ! git diff --cached --quiet; then
+                git commit -m "[AVASAM] Add final batch [skip ci]"
+                for i in {1..5}; do
+                  if timeout 180 git push origin HEAD:"$BRANCH"; then break; fi
+                  sleep $((5 + RANDOM % 10))
+                  git fetch origin "$BRANCH" --quiet
+                  git reset --hard origin/"$BRANCH" --quiet
+                  cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null
+                  for f in "${BATCH_FILES[@]}"; do git add "$f" 2>/dev/null; done
+                  git commit -m "[AVASAM] Add final batch [skip ci]" || true
+                done
+              fi
+            fi
+          }
+
+          if [ $TOTAL_FILES -gt 0 ]; then
+            push_batch "${ALL_FILES[@]}"
+          fi
+
+          # اکنون master README را بازسازی و push
+          git fetch origin "$BRANCH" --quiet
+          git reset --hard origin/"$BRANCH" --quiet
+          cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null
+          bash -c "$(declare -f generate_master_readme); generate_master_readme"
+          git add downloads/README.md
+          if ! git diff --cached --quiet; then
+            git commit -m "[AVASAM] Update master list [skip ci]"
+            for i in {1..5}; do
+              if timeout 60 git push origin HEAD:"$BRANCH"; then break; fi
+              sleep 5
+              git fetch origin "$BRANCH" --quiet
+              git reset --hard origin/"$BRANCH" --quiet
+              cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null
+              bash -c "$(declare -f generate_master_readme); generate_master_readme"
+              git add downloads/README.md
+              git commit -m "[AVASAM] Update master list [skip ci]" || true
+            done
+          fi
+          echo "All files pushed successfully."
